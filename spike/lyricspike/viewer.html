@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lyricspike viewer</title>
+<style>
+  :root { --bg:#111317; --fg:#d9dde3; --dim:#5d6572; --accent:#ff5fa2; --done:#c9a7ff; --warn:#e5a63b; --card:#1a1d23; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --fg:#1d2128; --dim:#9aa3b0; --accent:#d6246e; --done:#6c3fd1; --warn:#b36b00; --card:#fff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,"Segoe UI","Yu Gothic UI",sans-serif; }
+  header { position:sticky; top:0; z-index:2; background:var(--card); padding:12px 16px; border-bottom:1px solid #0003; display:grid; gap:8px; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; font-size:13px; }
+  audio { width:100%; }
+  main { max-width:820px; margin:0 auto; padding:24px 16px 50vh; }
+  .line { padding:6px 8px; border-radius:8px; cursor:pointer; color:var(--dim); font-size:22px; }
+  .line.active { color:var(--fg); background:var(--card); }
+  .line .t { font-size:11px; color:var(--dim); margin-right:10px; font-variant-numeric:tabular-nums; }
+  .w { display:inline-block; margin-right:.3em; background:linear-gradient(90deg,var(--accent) var(--p,0%),currentColor var(--p,0%));
+       -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+  .w.done { color:var(--done); background:none; -webkit-text-fill-color:currentColor; }
+  .w.low { text-decoration:underline dotted var(--warn); text-underline-offset:4px; }
+  .hint { font-size:12px; color:var(--dim); }
+  input[type=range] { width:160px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <audio id="player" controls preload="auto"></audio>
+  <div class="row">
+    <label>Audio <select id="src"></select></label>
+    <label>Sync offset <input id="off" type="range" min="-1500" max="1500" step="10" value="0"> <span id="offv">0 ms</span></label>
+    <label>Speed <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option></select></label>
+    <span class="hint">Click a word to jump. Dotted underline = low alignment confidence. Use the offset slider to see whether sync is consistently early/late.</span>
+  </div>
+</header>
+<main id="lines"></main>
+<script>
+const P = /*__PAYLOAD__*/null;
+const $ = id => document.getElementById(id);
+$("title").textContent = P.title + "  (" + P.data.source + ")";
+const player = $("player"), srcSel = $("src");
+P.audio.forEach(([label, path]) => { const o = document.createElement("option"); o.value = path; o.textContent = label; srcSel.appendChild(o); });
+const loadSrc = () => { const t = player.currentTime, playing = !player.paused; player.src = srcSel.value; player.currentTime = t; if (playing) player.play(); };
+srcSel.onchange = loadSrc; if (P.audio.length) player.src = P.audio[0][1];
+$("rate").onchange = e => player.playbackRate = parseFloat(e.target.value);
+let offset = 0; $("off").oninput = e => { offset = parseInt(e.target.value) / 1000; $("offv").textContent = e.target.value + " ms"; };
+
+const ts = t => { const m = Math.floor(t / 60); return m + ":" + (t - 60 * m).toFixed(1).padStart(4, "0"); };
+const lines = P.data.lines.filter(l => l.start !== null), root = $("lines"), els = [];
+lines.forEach((l, i) => {
+  const d = document.createElement("div"); d.className = "line";
+  const tm = document.createElement("span"); tm.className = "t"; tm.textContent = ts(l.start); d.appendChild(tm);
+  const ws = l.words.filter(w => w.start !== null), spans = [];
+  l.words.forEach((w) => {
+    const s = document.createElement("span"); s.className = "w" + (w.score !== null && w.score < P.low ? " low" : "");
+    s.textContent = w.text; if (w.score !== null) s.title = "confidence " + w.score.toFixed(2);
+    s.onclick = ev => { ev.stopPropagation(); if (w.start !== null) { player.currentTime = Math.max(0, w.start - offset); } };
+    d.appendChild(s); spans.push(s);
+  });
+  d.onclick = () => { player.currentTime = Math.max(0, l.start - offset); };
+  root.appendChild(d); els.push({ d, spans, l });
+});
+
+// A word is highlighted from its start until the next word starts (continuous singing), or until just past
+// its own last character when a pause follows.
+function wordEnd(l, k) {
+  const w = l.words[k], next = l.words[k + 1];
+  const own = Math.max((w.end ?? w.start) + 0.25, w.start + 0.15);
+  if (next && next.start !== null && next.start - own < 0.6) return Math.max(next.start, w.start + 0.05);
+  return own;
+}
+let cur = -1;
+function tick() {
+  const t = player.currentTime + offset;
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) { if (lines[i].start <= t) idx = i; else break; }
+  if (idx !== cur) {
+    if (cur >= 0) els[cur].d.classList.remove("active");
+    cur = idx;
+    if (cur >= 0) { els[cur].d.classList.add("active"); els[cur].d.scrollIntoView({ block: "center", behavior: "smooth" }); }
+  }
+  els.forEach((e, i) => {
+    e.spans.forEach((s, k) => {
+      const w = e.l.words[k];
+      let st = "todo", p = 0;
+      if (i < idx) st = "done";
+      else if (i === idx && w.start !== null) {
+        const end = wordEnd(e.l, k);
+        if (t >= end) st = "done";
+        else if (t >= w.start) { st = "now"; p = Math.min(100, 100 * (t - w.start) / Math.max(0.05, end - w.start)); }
+      } else if (i === idx && w.start === null) {
+        st = "todo";
+      }
+      if (s._st !== st) { s.classList.toggle("done", st === "done"); s._st = st; }
+      if (st === "now") s.style.setProperty("--p", p.toFixed(1) + "%");
+      else if (s._p !== undefined) s.style.removeProperty("--p");
+      s._p = st === "now" ? p : undefined;
+    });
+  });
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

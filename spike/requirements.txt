@@ -1,0 +1,12 @@
+# Install the CUDA build of PyTorch FIRST (see README step 1), then:
+audio-separator[cpu]>=0.47
+faster-whisper>=1.2
+transformers>=4.45
+huggingface-hub
+soundfile>=0.12
+numpy>=2
+av>=12
+jiwer>=3
+pykakasi>=2.3
+imageio-ffmpeg>=0.5
+audioread  # imported by audio-separator but not declared by it

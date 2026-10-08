@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+# spike outputs and model caches
+spike/out/
+out/
+*.ckpt
+*.safetensors
