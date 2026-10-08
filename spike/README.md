@@ -102,6 +102,25 @@ Ideal test set: one clean-vocal song, one very processed hyperpop/digicore track
 | `FFmpeg` errors | the spike falls back to a bundled copy; or `winget install Gyan.FFmpeg` |
 | Alignment looks scrambled with `--lyrics` | the lyrics probably contain lines not actually sung (or are missing some); the least-confident lines in `report.md` show where it went wrong |
 | Very slow | expected on a 4 GB laptop GPU with `--ensemble` / `--karaoke-model`; compare the stage times in `report.md` |
+| **Female / high-pitched / heavily processed vocals come out empty or wrong** | see the triage below |
+
+### Female or processed vocals: find which stage is failing
+
+Open `report.md`, section **"Where did the audio go?"**, and `asr\vocals_regions.tsv`, then:
+
+1. **Is the voice in the isolated stem at all?** Open `viewer.html`, switch *Audio* to `vocals (isolated)` and listen.
+   If the voice is missing, thin or full of artifacts, **separation** is the problem (no transcriber can fix that):
+   try another model, e.g. `--sep-model bs_roformer_vocals_gabox.ckpt` or `--ensemble`, and compare the stems.
+2. **Low "cover of song"?** Sung parts were never found. The stem is too quiet there; look at *stem level* vs *detect threshold*.
+3. **Many EMPTY regions?** The voice was found but Whisper returned nothing. Run again with `--dump-regions`, play a few
+   files from `asr\regions_vocals\`, and look at their `avg_logprob` / `max_no_speech` in the `.tsv`. (Earlier versions
+   of the spike let Whisper silently skip anything it judged "not speech"; singing often is. That is now off by default.
+   `--whisper-guards` turns it back on for comparison.)
+4. **Text exists but is wrong or in the wrong language?** Check the `language per region` column: for a single-language
+   song force it with `--lang en` or `--lang ja`. High or pitched-up voices are often better understood slightly lower, so
+   try `--pitch-shifts 0,-3` (or `0,-5`): each region is transcribed at each shift and the most confident result is kept.
+   The report shows which shift won how often; if `0` always wins, the idea does not help on your songs.
+5. Lines Whisper itself doubts are kept and marked `[?]` in `asr\<variant>.txt` instead of being dropped.
 
 ## 6. Known limits of this spike (on purpose)
 

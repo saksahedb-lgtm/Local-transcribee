@@ -85,6 +85,24 @@ def write_report(path: Path, ctx: dict) -> None:
             L.append("\nWER counts words (not meaningful for Japanese). CER counts characters. pCER compares "
                      "romanized text, so kanji-vs-kana spelling differences do not count as errors. "
                      "Lower is better. Repeated choruses abbreviated in the reference will inflate the numbers.")
+        diag = {n: r["region_stats"] for n, r in ctx["asr"].items() if r.get("region_stats")}
+        if diag:
+            L.append("\n### Where did the audio go? (per sung region)\n")
+            L.append("| variant | regions | cover of song | EMPTY | uncertain | stem level (p95) | detect threshold | "
+                     "language per region | pitch shift that won |")
+            L.append("|---|---|---|---|---|---|---|---|---|")
+            for name, st in diag.items():
+                db = lambda v: "n/a" if v is None else f"{v:.0f} dB"
+                langs = ", ".join(f"{k}:{v}" for k, v in sorted(st["langs"].items())) or "-"
+                wins = ", ".join(f"{k:+d}:{v}" for k, v in sorted(st["shift_wins"].items())) or "-"
+                L.append(f"| {name} | {st['total']} | {100 * st['coverage']:.0f}% | {st['empty']} | {st['uncertain']} | "
+                         f"{db(st.get('p95_db'))} | {db(st.get('threshold_db'))} | {langs} | {wins} |")
+            L.append("\nHow to read this: **EMPTY** regions were found as sung but Whisper returned no text; "
+                     "**uncertain** ones have text Whisper itself doubts (marked `[?]` in `asr/<variant>.txt`). "
+                     "If most regions are EMPTY or the wrong language, the problem is the transcriber's view of that "
+                     "voice. If the song has sung parts that are not covered at all (low *cover of song*), the "
+                     "vocal stem is missing them (a separation problem). Every region's text and scores are in "
+                     "`asr/<variant>_regions.tsv`; add `--dump-regions` to hear what Whisper was given.")
         dropped = ctx.get("dropped", {})
         if dropped:
             L.append("\nSegments removed by the hallucination filter:")

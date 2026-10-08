@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--prompt", help="text that primes spelling/style, e.g. artist names and slang")
     g.add_argument("--variants", help="comma list from: mix_raw, mix_seg, vocals, lead, backing "
                    "(default: mix_raw plus every stem available)")
+    g.add_argument("--pitch-shifts", default="0", help="comma list of semitone shifts to try per region, keeping "
+                   "the most confident, e.g. '0,-3' (lowers high or pitched-up voices; slower; default: 0)")
+    g.add_argument("--whisper-guards", action="store_true", help="re-enable Whisper's own 'not speech / unsure -> skip "
+                   "the audio' checks on sung regions (off by default: they silently drop singing)")
+    g.add_argument("--dump-regions", action="store_true", help="save the exact audio Whisper hears for each sung "
+                   "region (asr/regions_<variant>/) so you can listen to it")
 
     g = r.add_argument_group("alignment")
     g.add_argument("--no-align", action="store_true")

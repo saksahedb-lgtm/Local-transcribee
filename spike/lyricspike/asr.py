@@ -48,11 +48,53 @@ def parse_lang(spec: str) -> LangPolicy:
     return LangPolicy("fixed" if len(items) == 1 else "restricted", items)
 
 
+UNCERTAIN_LOGPROB = -1.0   # Whisper's own "not confident" line
+UNCERTAIN_NO_SPEECH = 0.6  # Whisper's own "does not sound like speech" line
+
+
 @dataclass
 class AsrOptions:
     beam: int = 3
     prompt: str | None = None
     temperature: tuple = (0.0, 0.2, 0.4, 0.6)
+    # Whisper silently SKIPS an audio window when it thinks "not speech" (> 0.6) and is unsure (logprob <= -1.0).
+    # Sung / pitched / processed voices trip that easily, so for sung regions the guards are off by default and
+    # doubtful lines are kept and flagged "uncertain" instead of vanishing.
+    guards: bool = False
+    # Extra hypotheses: transcribe each region also pitch-shifted by these many semitones, keep the most confident.
+    pitch_shifts: tuple = (0,)
+
+
+@dataclass
+class Region:
+    """Diagnostics for one sung region: what Whisper heard and how sure it was."""
+    start: float
+    end: float
+    lang: str | None = None
+    shift: int = 0
+    n_segments: int = 0
+    avg_logprob: float | None = None
+    max_no_speech: float | None = None
+    text: str = ""
+    candidates: dict = field(default_factory=dict)  # semitone shift -> confidence (None = produced no text)
+
+    @property
+    def status(self) -> str:
+        if not self.text.strip():
+            return "EMPTY"
+        if (self.avg_logprob is not None and self.avg_logprob < UNCERTAIN_LOGPROB) or \
+                (self.max_no_speech is not None and self.max_no_speech > UNCERTAIN_NO_SPEECH):
+            return "uncertain"
+        return "ok"
+
+
+def shift_pitch(audio: np.ndarray, semitones: float, sr: int = SR) -> np.ndarray:
+    """Pitch-shift without changing duration (a negative value lowers the voice)."""
+    if not semitones:
+        return audio
+    import librosa
+
+    return librosa.effects.pitch_shift(audio.astype(np.float32), sr=sr, n_steps=float(semitones)).astype(np.float32)
 
 
 def load_model(name: str, device: str, compute_type: str | None, download_root: str | None = None):
@@ -75,46 +117,85 @@ def choose_language(model, audio: np.ndarray, policy: LangPolicy) -> str | None:
     return max(policy.langs, key=lambda code: probs.get(code, 0.0))
 
 
-def _run(model, audio: np.ndarray, lang: str | None, opts: AsrOptions, multilingual: bool = False):
+def _run(model, audio: np.ndarray, lang: str | None, opts: AsrOptions, multilingual: bool = False,
+         guards: bool = True):
     return model.transcribe(
         audio, language=lang, beam_size=opts.beam, best_of=3, temperature=list(opts.temperature),
-        condition_on_previous_text=False, compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
-        no_speech_threshold=0.6, initial_prompt=opts.prompt, vad_filter=False, word_timestamps=False,
-        multilingual=multilingual,
+        condition_on_previous_text=False, compression_ratio_threshold=2.4,
+        log_prob_threshold=UNCERTAIN_LOGPROB if guards else None,
+        no_speech_threshold=UNCERTAIN_NO_SPEECH if guards else None,
+        initial_prompt=opts.prompt, vad_filter=False, word_timestamps=False, multilingual=multilingual,
     )
 
 
+def _make_seg(s, start_offset: float, lang, slice_range=None) -> Seg:
+    seg = Seg(start_offset + s.start, start_offset + s.end, s.text.strip(), lang, s.avg_logprob, s.no_speech_prob)
+    if slice_range:
+        seg.slice_start, seg.slice_end = slice_range
+    if (s.avg_logprob is not None and s.avg_logprob < UNCERTAIN_LOGPROB) or \
+            (s.no_speech_prob is not None and s.no_speech_prob > UNCERTAIN_NO_SPEECH):
+        seg.flags.append("uncertain")
+    return seg
+
+
 def transcribe_full(model, audio: np.ndarray, policy: LangPolicy, opts: AsrOptions) -> list[Seg]:
-    """Baseline: hand the whole file to Whisper in one go."""
+    """Baseline: hand the whole file to Whisper in one go, with Whisper's normal skip guards."""
     if policy.mode == "fixed":
         lang, multilingual = policy.langs[0], False
     else:
         lang, multilingual = None, True
-    segments, info = _run(model, audio, lang, opts, multilingual)
-    return [Seg(s.start, s.end, s.text.strip(), lang or info.language, s.avg_logprob, s.no_speech_prob)
-            for s in segments]
+    segments, info = _run(model, audio, lang, opts, multilingual, guards=True)
+    return [_make_seg(s, 0.0, lang or info.language) for s in segments]
+
+
+def _confidence(segs: list[Seg]) -> float | None:
+    """Duration-weighted mean log-probability of a hypothesis; None when it produced no text."""
+    segs = [s for s in segs if s.text and s.avg_logprob is not None]
+    if not segs:
+        return None
+    weights = np.array([max(s.end - s.start, 0.05) for s in segs])
+    return float(np.average([s.avg_logprob for s in segs], weights=weights))
 
 
 def transcribe_slices(model, audio: np.ndarray, slices: list[tuple[float, float]], policy: LangPolicy,
-                      opts: AsrOptions) -> list[Seg]:
-    """Transcribe each sung region separately: no context bleeds between regions, so no repetition loops."""
+                      opts: AsrOptions) -> tuple[list[Seg], list[Region]]:
+    """Transcribe each sung region separately: no context bleeds between regions, so no repetition loops.
+
+    Returns (segments, one Region diagnostic per region). With several `opts.pitch_shifts` every region is
+    transcribed at each shift and the most confident hypothesis wins.
+    """
     out: list[Seg] = []
+    regions: list[Region] = []
     for i, (a, b) in enumerate(slices, 1):
         chunk = audio[int(a * SR): int(b * SR)]
         if len(chunk) < int(0.3 * SR):
             continue
         lang = choose_language(model, chunk, policy)
-        segments, _info = _run(model, chunk, lang, opts)
-        for s in segments:
-            out.append(Seg(a + s.start, a + s.end, s.text.strip(), lang, s.avg_logprob, s.no_speech_prob,
-                           slice_start=a, slice_end=b))
+        best = None  # (rank, shift, segs)
+        candidates: dict = {}
+        for shift in opts.pitch_shifts:
+            segments, _info = _run(model, shift_pitch(chunk, shift), lang, opts, guards=opts.guards)
+            segs = [_make_seg(s, a, lang, (a, b)) for s in segments if s.text.strip()]
+            conf = _confidence(segs)
+            candidates[shift] = conf
+            rank = float("-inf") if conf is None else conf
+            if best is None or rank > best[0]:
+                best = (rank, shift, segs)
+        _rank, shift, segs = best
+        out.extend(segs)
+        probs = [s.no_speech_prob for s in segs if s.no_speech_prob is not None]
+        regions.append(Region(a, b, lang, shift, len(segs), candidates[shift], max(probs) if probs else None,
+                              " ".join(s.text for s in segs), candidates))
         if i % 10 == 0 or i == len(slices):
             log(f"  transcribed {i}/{len(slices)} regions")
-    return out
+    return out, regions
 
 
-def filter_segments(segs: list[Seg]) -> tuple[list[Seg], list[tuple[Seg, str]]]:
-    """Drop likely hallucinations and runaway repeats. Returns (kept, [(dropped, reason)])."""
+def filter_segments(segs: list[Seg], drop_silence: bool = False) -> tuple[list[Seg], list[tuple[Seg, str]]]:
+    """Drop likely hallucinations and runaway repeats. Returns (kept, [(dropped, reason)]).
+
+    Doubtful-but-real lines are kept (flagged "uncertain"); `drop_silence=True` restores Whisper-style removal.
+    """
     kept: list[Seg] = []
     dropped: list[tuple[Seg, str]] = []
     run_text, run_len = None, 0
@@ -126,8 +207,8 @@ def filter_segments(segs: list[Seg]) -> tuple[list[Seg], list[tuple[Seg, str]]]:
         if _HALLUC_RE.search(text):
             dropped.append((s, "known hallucination phrase"))
             continue
-        if s.no_speech_prob is not None and s.avg_logprob is not None \
-                and s.no_speech_prob > 0.8 and s.avg_logprob < -1.0:
+        if drop_silence and s.no_speech_prob is not None and s.avg_logprob is not None \
+                and s.no_speech_prob > 0.8 and s.avg_logprob < UNCERTAIN_LOGPROB:
             dropped.append((s, "looks like silence"))
             continue
         norm = re.sub(r"\W+", "", text.lower())

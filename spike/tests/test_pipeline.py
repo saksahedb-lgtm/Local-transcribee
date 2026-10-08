@@ -65,7 +65,8 @@ def args_for(song, tmp_path, **over):
                 device="cpu", force=False, no_separate=False, sep_model=None, ensemble=False,
                 karaoke_model=None, sep_precision="fp16", sep_segment=None, sep_overlap=None, model_dir=None,
                 no_asr=False, asr_model="tiny", asr_compute=None, beam=1, prompt=None, variants=None,
-                no_align=False, align_from=None, align_on="vocals", aligner_model="x")
+                no_align=False, align_from=None, align_on="vocals", aligner_model="x",
+                pitch_shifts="0", whisper_guards=False, dump_regions=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -110,3 +111,30 @@ def test_failures_are_reported_not_fatal(patched, tmp_path, monkeypatch):
     text = report.read_text(encoding="utf-8")
     assert "Problems" in text and "out of memory" in text and "--sep-segment" in text
     assert "mix_raw" in text      # the baseline still ran
+
+
+def test_region_diagnostics_written_and_dump_regions(patched, tmp_path):
+    report = pipeline.run(args_for(patched, tmp_path, dump_regions=True, no_align=True))
+    out = report.parent
+    tsv = (out / "asr" / "vocals_regions.tsv").read_text(encoding="utf-8").splitlines()
+    assert tsv[0].startswith("#\tstart") and len(tsv) >= 4          # header + the 3 synthetic sung regions
+    assert "\tok\t" in tsv[1] or "\tuncertain\t" in tsv[1]
+    wavs = sorted((out / "asr" / "regions_vocals").glob("*.wav"))
+    assert len(wavs) == len(tsv) - 1
+    text = report.read_text(encoding="utf-8")
+    assert "Where did the audio go" in text and "cover of song" in text
+
+
+def test_empty_regions_are_reported_loudly(patched, tmp_path, monkeypatch):
+    class Silent(FakeModel):
+        def transcribe(self, audio, language=None, **kw):
+            return iter([]), types.SimpleNamespace(language=language or "en")
+
+    monkeypatch.setattr(asr, "load_model", lambda *a, **k: Silent())
+    report = pipeline.run(args_for(patched, tmp_path, no_align=True))
+    text = report.read_text(encoding="utf-8")
+    row = [l for l in text.splitlines() if l.startswith("| vocals |") and "%" in l][0]
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[1] == "3" and cells[3] == "3"                        # 3 regions, all 3 EMPTY
+    tsv = (report.parent / "asr" / "vocals_regions.tsv").read_text(encoding="utf-8")
+    assert tsv.count("\tEMPTY\t") == 3

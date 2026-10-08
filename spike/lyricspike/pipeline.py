@@ -120,7 +120,10 @@ def run(args) -> Path:
         try:
             with stages.stage("load Whisper"):
                 model = asr.load_model(args.asr_model, device, args.asr_compute)
-            policy, opts = asr.parse_lang(args.lang), asr.AsrOptions(beam=args.beam, prompt=args.prompt)
+            shifts = tuple(int(x) for x in str(args.pitch_shifts).split(",") if x.strip() != "") or (0,)
+            policy = asr.parse_lang(args.lang)
+            opts = asr.AsrOptions(beam=args.beam, prompt=args.prompt, guards=args.whisper_guards, pitch_shifts=shifts)
+            ctx["pitch_shifts"] = shifts
             region_cache: dict[str, list] = {}
             for name in wanted:
                 audio_key, seg_key = specs[name]
@@ -129,30 +132,46 @@ def run(args) -> Path:
                     log(f"skipping variant '{name}': the stem it needs was not produced")
                     continue
                 t0 = time.perf_counter()
+                region_info: list[asr.Region] | None = None
+                spans = None
                 try:
                     with stages.stage(f"transcribe [{name}]"):
                         if seg_key is None:
-                            segs, regions = asr.transcribe_full(model, wave_of(audio_key), policy, opts), None
+                            segs = asr.transcribe_full(model, wave_of(audio_key), policy, opts)
                         else:
                             if seg_key not in region_cache:
                                 region_cache[seg_key] = audio.vocal_segments(wave_of(seg_key))
-                            regions = region_cache[seg_key]
-                            log(f"  {len(regions)} sung regions found in the {seg_key} stem")
-                            segs = asr.transcribe_slices(model, wave_of(audio_key), regions, policy, opts)
+                            spans = region_cache[seg_key]
+                            log(f"  {len(spans)} sung regions found in the {seg_key} stem")
+                            segs, region_info = asr.transcribe_slices(model, wave_of(audio_key), spans, policy, opts)
                 except Exception as exc:
                     fail(f"transcription [{name}]", exc)
                     continue
                 kept, dropped = asr.filter_segments(segs)
                 transcripts[name] = kept
                 ctx["dropped"][name] = [(s.text, why) for s, why in dropped]
-                text = "\n".join(f"[{_fmt_ts(s.start)}] {s.text}" for s in kept)
+                text = "\n".join(f"[{_fmt_ts(s.start)}] {s.text}" + ("  [?]" if "uncertain" in s.flags else "")
+                                 for s in kept)
                 (asr_dir / f"{name}.txt").write_text(text + "\n", encoding="utf-8")
                 (asr_dir / f"{name}.json").write_text(
                     json.dumps([s.to_dict() for s in kept], ensure_ascii=False, indent=1), encoding="utf-8")
                 metrics = score.evaluate(reference_text, " ".join(s.text for s in kept)) if reference_text else None
                 ctx["asr"][name] = {"lines": len(kept), "seconds": time.perf_counter() - t0, "metrics": metrics,
-                                    "regions": None if regions is None else len(regions)}
+                                    "regions": None if spans is None else len(spans),
+                                    "uncertain_lines": sum(1 for s in kept if "uncertain" in s.flags)}
                 ctx["files"] += [f"asr/{name}.txt", f"asr/{name}.json"]
+                if region_info is not None:
+                    stats = _region_stats(region_info, ctx["duration"], audio.describe_levels(wave_of(seg_key)))
+                    ctx["asr"][name]["region_stats"] = stats
+                    _write_regions_tsv(asr_dir / f"{name}_regions.tsv", region_info)
+                    ctx["files"].append(f"asr/{name}_regions.tsv")
+                    if args.dump_regions:
+                        _dump_regions(asr_dir / f"regions_{name}", wave_of(audio_key), region_info)
+                        ctx["files"].append(f"asr/regions_{name}/")
+                    if stats["total"] and stats["empty"] / stats["total"] >= 0.3:
+                        log(f"!! {stats['empty']} of {stats['total']} sung regions in [{name}] produced NO text. "
+                            f"Re-run with --dump-regions and listen to what Whisper was given "
+                            f"(see {name}_regions.tsv).")
             del model
             free_gpu()
         except Exception as exc:
@@ -220,3 +239,36 @@ def _choose_draft(preferred: str | None, transcripts: dict, asr_ctx: dict) -> st
         if name in transcripts:
             return name
     return next(iter(transcripts))
+
+
+def _region_stats(regions: list, duration: float, levels: dict) -> dict:
+    """Summarise a variant's sung regions: how many, how much audio, how many came back empty/uncertain."""
+    statuses = [r.status for r in regions]
+    shift_wins: dict[int, int] = {}
+    lang_counts: dict[str, int] = {}
+    for r in regions:
+        if r.text.strip():
+            shift_wins[r.shift] = shift_wins.get(r.shift, 0) + 1
+        lang_counts[r.lang or "?"] = lang_counts.get(r.lang or "?", 0) + 1
+    covered = sum(r.end - r.start for r in regions)
+    return {"total": len(regions), "empty": statuses.count("EMPTY"), "uncertain": statuses.count("uncertain"),
+            "coverage": covered / duration if duration else 0.0, "shift_wins": shift_wins,
+            "langs": lang_counts, **levels}
+
+
+def _write_regions_tsv(path: Path, regions: list) -> None:
+    rows = ["#\tstart\tend\tsec\tstatus\tlang\tshift\tlines\tavg_logprob\tmax_no_speech\ttext"]
+    for i, r in enumerate(regions, 1):
+        fmt = lambda v: "" if v is None else f"{v:.2f}"
+        text = " ".join(r.text.split())
+        rows.append(f"{i}\t{_fmt_ts(r.start)}\t{_fmt_ts(r.end)}\t{r.end - r.start:.1f}\t{r.status}\t{r.lang or ''}\t"
+                    f"{r.shift}\t{r.n_segments}\t{fmt(r.avg_logprob)}\t{fmt(r.max_no_speech)}\t{text}")
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _dump_regions(folder: Path, wave, regions: list) -> None:
+    """Save the exact audio Whisper was given for each region so you can listen to it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for i, r in enumerate(regions, 1):
+        chunk = wave[int(r.start * 16000): int(r.end * 16000)]
+        audio.write_wav(folder / f"{i:03d}_{int(r.start // 60):02d}-{r.start % 60:04.1f}_{r.status}.wav", chunk, 16000)

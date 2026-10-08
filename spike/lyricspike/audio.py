@@ -54,6 +54,27 @@ def _runs(mask: np.ndarray) -> list[list[int]]:
     return [[int(s), int(e)] for s, e in zip(edges[0::2], edges[1::2])]
 
 
+def _frame_db(wave: np.ndarray, sr: int, frame_s: float) -> np.ndarray:
+    """RMS level in dB for consecutive frames of `frame_s` seconds."""
+    frame = int(frame_s * sr)
+    n_frames = len(wave) // frame
+    if n_frames == 0:
+        return np.zeros(0)
+    frames = wave[: n_frames * frame].reshape(n_frames, frame).astype(np.float64)
+    return 20 * np.log10(np.sqrt((frames**2).mean(axis=1) + 1e-12))
+
+
+def describe_levels(wave: np.ndarray, sr: int = 16000, frame_s: float = 0.05, rel_db: float = 30.0,
+                    floor_db: float = -60.0) -> dict:
+    """How loud the stem is and where `vocal_segments` puts its 'singing starts here' threshold."""
+    db = _frame_db(wave, sr, frame_s)
+    if len(db) == 0:
+        return {"p95_db": None, "threshold_db": None, "active_fraction": 0.0}
+    p95 = float(np.percentile(db, 95))
+    threshold = max(p95 - rel_db, floor_db)
+    return {"p95_db": p95, "threshold_db": threshold, "active_fraction": float((db > threshold).mean())}
+
+
 def vocal_segments(
     wave: np.ndarray,
     sr: int = 16000,
@@ -73,12 +94,9 @@ def vocal_segments(
     """
     n = len(wave)
     duration = n / sr
-    frame = int(frame_s * sr)
-    n_frames = n // frame
-    if n_frames == 0:
+    db = _frame_db(wave, sr, frame_s)
+    if len(db) == 0:
         return []
-    frames = wave[: n_frames * frame].reshape(n_frames, frame).astype(np.float64)
-    db = 20 * np.log10(np.sqrt((frames**2).mean(axis=1) + 1e-12))
     threshold = max(float(np.percentile(db, 95)) - rel_db, floor_db)
     runs = _runs(db > threshold)
 

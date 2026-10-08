@@ -47,11 +47,13 @@ def test_filter_segments():
     S = lambda t, lp=-0.3, ns=0.1: asr.Seg(0, 1, t, avg_logprob=lp, no_speech_prob=ns)
     segs = [S("real lyric"), S("Thanks for watching!"), S("la"), S("la"), S("la"), S("la"), S("la"),
             S("noise", lp=-1.5, ns=0.95), S("")]
-    kept, dropped = asr.filter_segments(segs)
-    assert [s.text for s in kept] == ["real lyric", "la", "la", "la"]
+    kept, dropped = asr.filter_segments(segs)           # default: doubtful-but-real lines are KEPT
+    assert [s.text for s in kept] == ["real lyric", "la", "la", "la", "noise"]
     reasons = [r for _, r in dropped]
-    assert "known hallucination phrase" in reasons and "looks like silence" in reasons
+    assert "known hallucination phrase" in reasons and "looks like silence" not in reasons
     assert reasons.count("repeated >3x in a row") == 2
+    kept2, dropped2 = asr.filter_segments(segs, drop_silence=True)   # old strict behaviour on request
+    assert "noise" not in [s.text for s in kept2] and "looks like silence" in [r for _, r in dropped2]
 
 
 def test_language_policy():
@@ -144,3 +146,24 @@ def test_load_vocab_falls_back_to_vocab_json(tmp_path, monkeypatch):
             return {"x": 1}
 
     assert align._load_vocab("m", GoodTokenizer) == ({"x": 1}, 7)
+
+
+def test_shift_pitch_moves_frequency_and_keeps_length():
+    pytest.importorskip("librosa")
+    sr = 16000
+    t = np.arange(sr) / sr
+    tone = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    down = asr.shift_pitch(tone, -12)
+    assert abs(len(down) - len(tone)) <= 1
+    peak = np.argmax(np.abs(np.fft.rfft(down))) * sr / len(down)
+    assert abs(peak - 220) < 8
+    assert asr.shift_pitch(tone, 0) is tone
+
+
+def test_describe_levels():
+    sr = 16000
+    wave = np.zeros(sr * 4, dtype=np.float32)
+    wave[sr: 2 * sr] = burst(sr, 1, 0.3)
+    lv = audio.describe_levels(wave, sr)
+    assert -25 < lv["p95_db"] < -5 and lv["threshold_db"] == pytest.approx(max(lv["p95_db"] - 30, -60))
+    assert 0.2 < lv["active_fraction"] < 0.3
